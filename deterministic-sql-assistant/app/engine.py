@@ -3,6 +3,8 @@ import re
 import logging
 import time
 import asyncpg
+import httpx
+import json
 from typing import Optional, List, Dict, Any, Tuple
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -20,21 +22,31 @@ logger = logging.getLogger("DeterministicSQLAssistant")
 
 # --- CONFIGURATION ---
 load_dotenv(".env")
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://chatbot_readonly:chatbot123@localhost:5433/nyx")
-ALLOWED_TABLES = ["ccod_bal"]
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://chatbot_readonly:chatbot123@localhost:5433/reconciliation")
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
+
+ALLOWED_TABLES = ["bgl_txn"]
 COLUMN_MAPPING = {
-    "customer": "cust_name",
-    "name": "cust_name",
-    "account": "accountno",
-    "acc_no": "accountno",
-    "balance": "currentbalance",
-    "amt": "currentbalance",
-    "interest": "intrate",
-    "rate": "intrate",
-    "branch_no": "branchno",
-    "branch_name": "branch_name",
-    "br_no": "branchno",
-    "brname": "branch_name"
+    "account": "acc_no",
+    "acc_no": "acc_no",
+    "bgl_no": "bgl_no",
+    "balance": "balance",
+    "amount": "balance",
+    "debit": "debit_amount",
+    "dr cr": "dr_cr",
+    "statement narration": "statement_narration",
+    "credit": "credit_amount",
+    "description": "bgl_description",
+    "branch": "branch_code",
+    "date": "post_date",
+    "trace": "trace_no",
+    "type": "type_no",
+    "txn code": "txn_code",
+    "post date": "post_date",
+    "trace number": "trace_no",
+    "rrn": "rrn",
+    "v id": "v_id"
 }
 
 # --- MODELS ---
@@ -49,6 +61,7 @@ class QueryResponse(BaseModel):
     error: Optional[str] = None
     sql: Optional[str] = None
     execution_time_ms: Optional[float] = None
+    method: Optional[str] = None # "fast" or "llm"
 
 # --- SECURITY ---
 FORBIDDEN_KEYWORDS = [
@@ -60,165 +73,177 @@ class SecurityManager:
     """Handles SQL injection protection and keyword whitelisting."""
 
     def validate_query(self, sql: str) -> Tuple[bool, Optional[str]]:
-        """
-        Validates if the generated SQL is safe for execution.
-        
-        Args:
-            sql: The SQL query string to validate.
-            
-        Returns:
-            A tuple of (is_valid, error_message).
-        """
         sql_lower = sql.lower()
-        
-        # 1. Enforce SELECT-only
         if not re.match(r"^\s*(select|with)\b", sql_lower):
-            logger.warning(f"Security Rejection: Non-SELECT query attempted: {sql[:50]}...")
             return False, "Only SELECT queries are allowed."
-            
-        # 2. Prevent forbidden DDL/DML keywords
         for keyword in FORBIDDEN_KEYWORDS:
             if re.search(rf"\b{keyword}\b", sql_lower):
-                logger.warning(f"Security Rejection: Forbidden keyword '{keyword}' detected.")
                 return False, f"Forbidden keyword detected: {keyword.upper()}"
-                
-        # 3. Prevent multi-statement queries
         if ";" in sql.strip().rstrip(";"):
-            logger.warning("Security Rejection: Multi-statement query attempted.")
             return False, "Multi-statement queries are forbidden."
-            
         return True, None
+
+# --- LLM INTENT EXTRACTION ---
+class LLMManager:
+    """Handles requests to Ollama for intent extraction."""
+    
+    def __init__(self):
+        self.api_url = f"{OLLAMA_URL}/api/generate"
+        self.model = OLLAMA_MODEL
+
+    async def extract_intent(self, user_query: str) -> Dict[str, Any]:
+        """Ask LLM to parse user query into structured search parameters."""
+        prompt = f"""
+        Analyze this bank transaction query: "{user_query}"
+        Extract parameters for a SQL search on table 'bgl_txn'.
+        Available columns: {list(COLUMN_MAPPING.values())}
+        
+        Respond ONLY with a JSON object:
+        {{
+          "acc_no": "value or null",
+          "columns": ["list", "of", "columns"],
+          "filters": {{"column": "value"}},
+          "limit": count
+        }}
+        """
+        
+        payload = {
+            "model": self.model,
+            "prompt": prompt,
+            "stream": False,
+            "format": "json"
+        }
+        
+        try:
+            logger.info(f"Requesting LLM intent for: {user_query}")
+            async with httpx.AsyncClient() as client:
+                response = await client.post(self.api_url, json=payload, timeout=30.0)
+                if response.status_code == 200:
+                    return json.loads(response.json()['response'])
+        except Exception as e:
+            logger.error(f"LLM extraction failed: {str(e)}")
+        
+        return {}
 
 # --- DETERMINISTIC CORE ---
 class DeterministicCore:
     """Core logic for parsing user intent and building safe SQL queries."""
     
     def __init__(self):
-        # Regex to extract numeric account numbers (10 to 20 digits)
         self.re_account = re.compile(r"(\d{10,20})")
         self.table = ALLOWED_TABLES[0]
 
-    def parse_and_build(self, text: str) -> Tuple[str, List[Any]]:
-        """
-        Parses user text to extract entities and build a parameterized SQL query.
-        
-        Args:
-            text: The raw user prompt.
-            
-        Returns:
-            A tuple of (sql_query, parameters).
-        """
+    def is_simple_query(self, text: str) -> bool:
+        """Determines if a query can be handled by the Fast Path (regex/keyword)."""
         text_lower = text.lower()
-        
-        # 1. Extract Entity (Account Number)
+        # If it's just an account number or simple balance check
+        if self.re_account.search(text_lower) and len(text.split()) < 6:
+            return True
+        return False
+
+    def build_fast_sql(self, text: str) -> Tuple[str, List[Any]]:
+        """Fast-path SQL building using regex."""
+        text_lower = text.lower()
         acc_match = self.re_account.search(text_lower)
         account_no = acc_match.group(1) if acc_match else None
         
-        # 2. Map Keywords to Database Columns
         extracted_cols = []
-        if any(w in text_lower for w in ["name", "customer"]): 
-            extracted_cols.append(COLUMN_MAPPING["name"])
-        if any(w in text_lower for w in ["balance", "amount", "amt"]): 
-            extracted_cols.append(COLUMN_MAPPING["balance"])
-        if any(w in text_lower for w in ["interest", "rate"]): 
-            extracted_cols.append(COLUMN_MAPPING["interest"])
-        if any(w in text_lower for w in ["branch", "br_no", "brname"]): 
-            extracted_cols.extend([COLUMN_MAPPING["br_no"], COLUMN_MAPPING["brname"]])
+        for key, col in COLUMN_MAPPING.items():
+            if key in text_lower:
+                extracted_cols.append(col)
 
-        # Deduplicate and format columns
         cols = ", ".join(set(extracted_cols)) if extracted_cols else "*"
         
-        # 3. Build Parameterized Query
         if account_no:
-            try:
-                # Convert to integer for BIGINT compatibility
-                acc_int = int(account_no)
-                sql = f"SELECT {cols} FROM {self.table} WHERE accountno = $1"
-                return sql, [acc_int]
-            except ValueError:
-                # Fallback to string if conversion fails (unlikely due to regex)
-                sql = f"SELECT {cols} FROM {self.table} WHERE accountno = $1"
-                return sql, [account_no]
+            return f"SELECT {cols} FROM {self.table} WHERE acc_no = $1", [account_no]
         
-        # Default behavior: Search with limit if no account identifier found
         return f"SELECT {cols} FROM {self.table} LIMIT 10", []
+
+    def build_llm_sql(self, intent: Dict[str, Any]) -> Tuple[str, List[Any]]:
+        """Builds SQL based on LLM extracted intent."""
+        cols = ", ".join(intent.get("columns", [])) or "*"
+        limit = intent.get("limit", 10)
+        params = []
+        where_clauses = []
+        
+        # Add account filter
+        if intent.get("acc_no"):
+            params.append(intent["acc_no"])
+            where_clauses.append(f"acc_no = ${len(params)}")
+            
+        # Add other filters if valid
+        filters = intent.get("filters", {})
+        for col, val in filters.items():
+            if col in COLUMN_MAPPING.values():
+                params.append(val)
+                where_clauses.append(f"{col} = ${len(params)}")
+        
+        where_sql = f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+        sql = f"SELECT {cols} FROM {self.table}{where_sql} LIMIT {limit}"
+        return sql, params
 
 # --- ENGINE ---
 class DeterministicEngine:
-    """Orchestrates the retrieval process: Connect -> Parse -> Build -> Validate -> Execute."""
+    """Orchestrates the retrieval process with Smart Routing."""
     
     def __init__(self):
         self.pool: Optional[asyncpg.Pool] = None
         self.security = SecurityManager()
         self.core = DeterministicCore()
+        self.llm = LLMManager()
 
     async def connect(self):
-        """Initializes the database connection pool."""
         if not self.pool:
             try:
-                logger.info("Initializing database connection pool...")
                 self.pool = await asyncpg.create_pool(DATABASE_URL)
-                logger.info("Database pool established successfully.")
+                logger.info("Database pool established.")
             except Exception as e:
-                logger.error(f"Failed to connect to database: {str(e)}", exc_info=True)
+                logger.error(f"DB connection failed: {str(e)}")
                 raise
 
     async def disconnect(self):
-        """Closes the database connection pool."""
         if self.pool:
-            logger.info("Closing database connection pool...")
             await self.pool.close()
-            logger.info("Database pool closed.")
 
     async def process_query(self, user_query: str) -> QueryResponse:
-        """
-        Processes a user query and returns a structured response.
-        
-        Args:
-            user_query: The natural language string from the user.
-            
-        Returns:
-            A QueryResponse object containing data, SQL, and status.
-        """
         start_time = time.time()
-        logger.info(f"Incoming Request: '{user_query}'")
+        method = "fast"
         
         try:
-            # 1. Parse and Build SQL
-            sql, params = self.core.parse_and_build(user_query)
-            
+            # 1. Smart Routing
+            if self.core.is_simple_query(user_query):
+                sql, params = self.core.build_fast_sql(user_query)
+                logger.info("Using Fast Path routing.")
+            else:
+                method = "llm"
+                intent = await self.llm.extract_intent(user_query)
+                if not intent:
+                    sql, params = self.core.build_fast_sql(user_query) # Fallback
+                else:
+                    sql, params = self.core.build_llm_sql(intent)
+                logger.info("Using LLM Path routing.")
+
             # 2. Security Validation
             is_valid, sec_error = self.security.validate_query(sql)
             if not is_valid:
                 return QueryResponse(success=False, error=sec_error, sql=sql)
 
-            # 3. Ensure DB Connectivity
-            if not self.pool:
-                await self.connect()
-
-            # 4. Execute with Read-Only Transaction
+            # 3. DB Execution
+            if not self.pool: await self.connect()
             async with self.pool.acquire() as conn:
                 async with conn.transaction(readonly=True):
-                    logger.info(f"Executing Deterministic SQL: {sql} | Params: {params}")
                     rows = await conn.fetch(sql, *params)
                     
             execution_time = (time.time() - start_time) * 1000
-            logger.info(f"Query successful. Found {len(rows)} rows in {execution_time:.2f}ms")
-            
             return QueryResponse(
-                success=True, 
-                data=[dict(r) for r in rows], 
-                sql=sql,
-                execution_time_ms=round(execution_time, 2)
+                success=True, data=[dict(r) for r in rows], 
+                sql=sql, execution_time_ms=round(execution_time, 2),
+                method=method
             )
 
-        except asyncpg.PostgresError as pg_err:
-            logger.error(f"Database Error: {str(pg_err)}", exc_info=True)
-            return QueryResponse(success=False, error=f"Database Retrieval Error: {str(pg_err)}", sql=locals().get('sql'))
-            
         except Exception as e:
-            logger.error(f"Unexpected Engine Error: {str(e)}", exc_info=True)
-            return QueryResponse(success=False, error="An internal processing error occurred.")
+            logger.error(f"Engine Error: {str(e)}", exc_info=True)
+            return QueryResponse(success=False, error=f"Processing Error: {str(e)}")
 
 # Global shared instance
 engine = DeterministicEngine()

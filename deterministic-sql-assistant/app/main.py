@@ -1,9 +1,11 @@
 import logging
 import time
+import uuid
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from app.engine import engine, QueryRequest, QueryResponse
-import uvicorn
+from pydantic import BaseModel
+from typing import Optional, List, Dict, Any
+from app.engine import engine, QueryResponse
 
 # --- LOGGING SETUP ---
 logger = logging.getLogger("DeterministicAPI")
@@ -13,6 +15,11 @@ app = FastAPI(
     description="Enterprise-grade structured retrieval engine.",
     version="2.0.0"
 )
+
+# --- MODELS ---
+class ChatRequest(BaseModel):
+    prompt: str
+    conversation_id: Optional[str] = None
 
 # --- LIFECYCLE ---
 @app.on_event("startup")
@@ -38,13 +45,36 @@ async def log_requests(request: Request, call_next):
     return response
 
 # --- ENDPOINTS ---
-@app.post("/query", response_model=QueryResponse, summary="Retrieve data deterministically")
-async def handle_query(request: QueryRequest):
+@app.post("/api/chat", summary="Chat interface for SQL retrieval")
+async def handle_chat(request: ChatRequest):
     """
-    Primary endpoint for structured SQL retrieval.
-    Parses natural language, builds safe SQL, and returns JSON results.
+    Primary endpoint for the frontend.
+    Matches the format expected by the React UI.
     """
-    return await engine.process_query(request.query)
+    result = await engine.process_query(request.prompt)
+    
+    # Prepare response in the format frontend expects
+    columns = []
+    rows = []
+    if result.success and result.data:
+        rows = result.data
+        if rows:
+            columns = list(rows[0].keys())
+
+    # Generate a dummy conversation ID if not provided
+    convo_id = request.conversation_id or str(uuid.uuid4())
+
+    # Map engine response to UI response
+    return {
+        "success": result.success,
+        "message": "Here is the data I found:" if result.success else result.error,
+        "sql": result.sql,
+        "rows": rows,
+        "columns": columns,
+        "error": result.error if not result.success else None,
+        "conversation_id": convo_id,
+        "method": result.method
+    }
 
 @app.get("/health", summary="Check system health")
 async def health_check():
@@ -66,5 +96,5 @@ async def global_exception_handler(request: Request, exc: Exception):
     )
 
 if __name__ == "__main__":
-    # Industry recommendation: Use environment variables for host/port
+    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
